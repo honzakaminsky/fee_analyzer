@@ -43,6 +43,13 @@ const FIELDS: FieldConfig[] = [
     type: "number",
     min: 0,
   },
+  {
+    key: "monthlyContribution",
+    label: "Pravidelná měsíční investice",
+    description: 'Měsíční vklad — hledej "pravidelná investice", "měsíční vklad", "trvalý příkaz". Pokud nemáš pravidelný vklad, nech 0.',
+    type: "number",
+    min: 0,
+  },
   // entryFeePercent se renderuje zvlášť s přepínačem % / částka
   {
     key: "annualFeePercent",
@@ -123,6 +130,9 @@ export default function ReviewPage() {
       performanceFeeBenchmark: 5,
       custodyFeePercent: 0,
       isin: "",
+      entryFeeMode: "upfront_fixed",
+      entryFeeFixedAmount: 0,
+      targetAmount: 0,
       ...parsed,
     });
   }, [router]);

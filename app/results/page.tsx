@@ -11,7 +11,7 @@ import {
   AlertTriangle, History,
 } from "lucide-react";
 import { ContractData, FundInfo } from "@/lib/types";
-import { calculateFees, formatCurrency, getDefaultProjectionEnd } from "@/lib/calculations";
+import { calculateFees, calcEntryFee, formatCurrency, getDefaultProjectionEnd } from "@/lib/calculations";
 
 // ── Tooltip ─────────────────────────────────────────────────────
 const CustomTooltip = ({ active, payload, label, currency }: {
@@ -110,6 +110,7 @@ export default function ResultsPage() {
   const router = useRouter();
   const [contract, setContract] = useState<ContractData | null>(null);
   const [fundPerf, setFundPerf] = useState<Partial<FundInfo> | null>(null);
+  const [showAssumptions, setShowAssumptions] = useState(false);
   const [projectionYears, setProjectionYears] = useState(10);
   const [customYearsInput, setCustomYearsInput] = useState("10");
   const [monthlyContribution, setMonthlyContribution] = useState(0);
@@ -120,13 +121,41 @@ export default function ResultsPage() {
     const stored = localStorage.getItem("contractData");
     if (!stored) { router.push("/"); return; }
     const parsed: ContractData = JSON.parse(stored);
+    // Zpětná kompatibilita — starší data nemusí mít entryFeeMode
+    if (!parsed.entryFeeMode) {
+      parsed.entryFeeMode = "upfront_fixed";
+      parsed.entryFeeFixedAmount = parsed.initialInvestment * (parsed.entryFeePercent / 100);
+      parsed.targetAmount = 0;
+    }
     setContract(parsed);
     setInvestmentOverride(parsed.initialInvestment);
     if (parsed.monthlyContribution) setMonthlyContribution(parsed.monthlyContribution);
 
-    const perfRaw = localStorage.getItem("fundPerformance");
-    if (perfRaw) {
-      try { setFundPerf(JSON.parse(perfRaw)); } catch { /* ignore */ }
+    // Výchozí výnos pro projekci: priorita — ručně zadaný → 5Y historický → 6 %
+    const savedReturn = (parsed as ContractData & { assumedAnnualReturn?: number }).assumedAnnualReturn;
+    let defaultReturn = 6;
+    if (savedReturn && savedReturn > 0) {
+      defaultReturn = savedReturn;
+    } else {
+      const perfRaw = localStorage.getItem("fundPerformance");
+      if (perfRaw) {
+        try {
+          const perf: Partial<FundInfo> = JSON.parse(perfRaw);
+          setFundPerf(perf);
+          if (perf.fiveYearReturn !== undefined && perf.fiveYearReturn > 0) {
+            defaultReturn = perf.fiveYearReturn;
+          }
+        } catch { /* ignore */ }
+      }
+    }
+    setAssumedReturn(defaultReturn);
+
+    // Pokud jsme perfRaw ještě nenačetli (výše v else větvi), načteme ho teď
+    if (savedReturn && savedReturn > 0) {
+      const perfRaw = localStorage.getItem("fundPerformance");
+      if (perfRaw) {
+        try { setFundPerf(JSON.parse(perfRaw)); } catch { /* ignore */ }
+      }
     }
   }, [router]);
 
@@ -197,7 +226,12 @@ export default function ResultsPage() {
         <p className="text-gray-500 text-sm">
           {contract.isin && <span className="font-mono mr-3">{contract.isin}</span>}
           TER {contract.annualFeePercent} %
-          {contract.entryFeePercent > 0 && ` · vstupní ${contract.entryFeePercent} %`}
+          {calcEntryFee(contract) > 0 && (() => {
+            const fee = calcEntryFee(contract);
+            return contract.entryFeeMode === "upfront_fixed"
+              ? ` · vstupní ${formatCurrency(fee, contract.currency)}`
+              : ` · vstupní ${contract.entryFeePercent} %`;
+          })()}
           {contract.performanceFeePercent > 0 && ` · výkonnostní ${contract.performanceFeePercent} %`}
           {contract.custodyFeePercent > 0 && ` · úschova ${contract.custodyFeePercent} %`}
         </p>
@@ -217,7 +251,7 @@ export default function ResultsPage() {
               { label: "1 rok",  val: fundPerf.oneYearReturn },
               { label: "3 roky", val: fundPerf.threeYearReturn },
               { label: "5 let",  val: fundPerf.fiveYearReturn },
-            ].map(({ label, val }) => val !== undefined ? (
+            ].map(({ label, val }) => val !== undefined && val !== null ? (
               <div key={label} className={`rounded-xl p-4 text-center border ${val >= 0 ? "bg-green-50 border-green-200" : "bg-red-50 border-red-200"}`}>
                 <p className={`text-2xl font-bold ${val >= 0 ? "text-green-700" : "text-red-600"}`}>
                   {val > 0 ? "+" : ""}{val} %
@@ -308,7 +342,12 @@ export default function ResultsPage() {
         <div className="grid grid-cols-2 md:grid-cols-3 gap-4 mb-6">
           <StatCard label={`Celkem poplatky do ${endYear}`} value={formatCurrency(result.projectedTotalFees, currency)} sub={`Odhad za ${projectionYears} let od startu`} color="red" />
           <StatCard label="ETF by stálo (0,22 %)" value={formatCurrency(result.etfTotalFees, currency)} sub="Vanguard VWCE / iShares IWDA" color="green" />
-          <StatCard label="Přeplatíš vs ETF" value={formatCurrency(result.potentialSavings, currency)} sub={`Odhad za ${projectionYears} let navíc`} color="red" />
+          <StatCard
+            label={result.potentialSavings >= 0 ? "Přeplatíš vs ETF" : "ETF by bylo dražší"}
+            value={formatCurrency(Math.abs(result.potentialSavings), currency)}
+            sub={result.potentialSavings >= 0 ? `Odhad za ${projectionYears} let navíc` : `Tvůj fond je levnější o tuto částku`}
+            color={result.potentialSavings >= 0 ? "red" : "green"}
+          />
         </div>
       </div>
 
@@ -416,47 +455,62 @@ export default function ResultsPage() {
           <div className="flex justify-between text-xs text-gray-400"><span>1 rok</span><span>50 let</span></div>
         </div>
 
-        {/* Vklady a předpoklady */}
-        <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-6">
-          <h3 className="font-semibold text-gray-900 mb-4 flex items-center gap-2">
-            <Wallet className="w-4 h-4 text-green-600" /> Vklady a předpoklady
-          </h3>
-          <div className="space-y-5">
+        {/* Vklady a předpoklady — accordion */}
+        <div className="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden">
+          <button
+            onClick={() => setShowAssumptions((v) => !v)}
+            className="w-full flex items-center justify-between px-6 py-5 text-left hover:bg-gray-50 transition-colors"
+          >
+            <h3 className="font-semibold text-gray-900 flex items-center gap-2">
+              <Wallet className="w-4 h-4 text-green-600" /> Vklady a předpoklady
+            </h3>
+            <span className="text-gray-400 text-lg leading-none">{showAssumptions ? "▲" : "▼"}</span>
+          </button>
+          {showAssumptions && (
+            <div className="px-6 pb-6 space-y-5 border-t border-gray-100 pt-4">
 
-            <SliderWithInput
-              label="Počáteční investice"
-              value={investmentOverride ?? contract.initialInvestment}
-              onChange={setInvestmentOverride}
-              min={0} max={5000000} step={10000}
-              unit={currency}
-              formatDisplay={(v) => fmt(v)}
-            />
-
-            <SliderWithInput
-              label="Měsíční vklad"
-              value={monthlyContribution}
-              onChange={setMonthlyContribution}
-              min={0} max={50000} step={500}
-              unit={currency}
-              formatDisplay={(v) => fmt(v)}
-            />
-
-            <div>
               <SliderWithInput
-                label="Předpokládaný roční výnos"
-                value={assumedReturn}
-                onChange={setAssumedReturn}
-                min={0} max={30} step={0.5}
-                unit="%"
-                formatDisplay={(v) => `${v} %`}
+                label="Počáteční investice"
+                value={investmentOverride ?? contract.initialInvestment}
+                onChange={setInvestmentOverride}
+                min={0} max={5000000} step={10000}
+                unit={currency}
+                formatDisplay={(v) => fmt(v)}
               />
-              <div className="mt-2 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 text-xs text-gray-500">
-                ℹ️ <strong>Pouze informativní</strong> — používá se výhradně pro výpočet výkonnostního poplatku
-                a orientační vývoj portfolia. Není to prognóza výnosu.
-              </div>
-            </div>
 
-          </div>
+              <SliderWithInput
+                label="Měsíční vklad"
+                value={monthlyContribution}
+                onChange={setMonthlyContribution}
+                min={0} max={50000} step={500}
+                unit={currency}
+                formatDisplay={(v) => fmt(v)}
+              />
+
+              <div>
+                <SliderWithInput
+                  label={
+                    fundPerf?.fiveYearReturn !== undefined
+                      ? `Předpokládaný roční výnos (5Y p.a. = ${fundPerf.fiveYearReturn} %)`
+                      : "Předpokládaný roční výnos"
+                  }
+                  value={assumedReturn}
+                  onChange={setAssumedReturn}
+                  min={0} max={30} step={0.5}
+                  unit="%"
+                  formatDisplay={(v) => `${v} %`}
+                />
+                <div className="mt-2 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 text-xs text-gray-500">
+                  ℹ️ <strong>Pouze informativní</strong> — používá se výhradně pro výpočet výkonnostního poplatku
+                  a orientační vývoj portfolia. Není to prognóza výnosu.
+                  {fundPerf?.fiveYearReturn !== undefined && (
+                    <span className="ml-1">Předvyplněno z historického 5Y výnosu fondu.</span>
+                  )}
+                </div>
+              </div>
+
+            </div>
+          )}
         </div>
       </div>
 

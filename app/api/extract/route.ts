@@ -143,6 +143,9 @@ export async function POST(req: NextRequest) {
       contractStartDate:
         extracted.contractStartDate || new Date().toISOString().split("T")[0],
       initialInvestment: Math.max(0, Number(extracted.initialInvestment) || 0),
+      entryFeeMode: "upfront_fixed",
+      entryFeeFixedAmount: 0,
+      targetAmount: 0,
       entryFeePercent: Math.min(20, Math.max(0, Number(extracted.entryFeePercent) || 0)),
       annualFeePercent: Math.min(10, Math.max(0, Number(extracted.annualFeePercent) || 1.5)),
       exitFeePercent: Math.min(10, Math.max(0, Number(extracted.exitFeePercent) || 0)),
@@ -154,6 +157,35 @@ export async function POST(req: NextRequest) {
         ? extracted.currency
         : "CZK") as "CZK" | "EUR" | "USD",
     };
+
+    // ── Obohaťme data z fund-lookup pokud máme ISIN ─────────────────
+    // fund-lookup má přístup k Conseq, Morningstar CZ, kurzy.cz atd.
+    // a vrátí autoritativnější TER než AI čtení z dokumentu
+    if (result.isin && result.isin.length >= 12) {
+      try {
+        const origin = new URL(req.url).origin;
+        const lookupUrl = `${origin}/api/fund-lookup?q=${encodeURIComponent(result.isin)}`;
+        console.log(`[extract] Enriching from fund-lookup: ${lookupUrl}`);
+        const lookupRes = await fetch(lookupUrl, {
+          signal: AbortSignal.timeout(20000),
+        });
+        if (lookupRes.ok) {
+          const lookup = await lookupRes.json() as { name?: string; ter?: number; source?: string };
+          console.log(`[extract] fund-lookup enrichment: name="${lookup.name}" ter=${lookup.ter} source="${lookup.source}"`);
+          // Použij TER z fund-lookup (webové zdroje jsou přesnější než AI čtení PDF)
+          if (typeof lookup.ter === "number" && lookup.ter > 0) {
+            result.annualFeePercent = lookup.ter;
+          }
+          // Doplň název z fund-lookup pokud AI nic nenašla
+          if ((!result.fundName || result.fundName === "Neznámý fond") && lookup.name) {
+            result.fundName = lookup.name;
+          }
+        }
+      } catch (lookupErr) {
+        // Fund-lookup není kritický — pokračujeme s Claude daty
+        console.log(`[extract] fund-lookup enrichment skipped: ${lookupErr}`);
+      }
+    }
 
     return NextResponse.json(result);
   } catch (error: unknown) {

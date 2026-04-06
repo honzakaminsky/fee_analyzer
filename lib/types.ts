@@ -1,3 +1,9 @@
+// Způsob účtování vstupního poplatku
+export type EntryFeeMode =
+  | "upfront_fixed"        // Předplacený — fixní částka v Kč/€
+  | "per_contribution_pct" // Pravidelný — % z každého vkladu
+  | "target_pct";          // % z cílové/smluvní částky
+
 export interface ContractData {
   fundName: string;
   providerName?: string;       // název poskytovatele / správce fondu
@@ -6,8 +12,12 @@ export interface ContractData {
   initialInvestment: number;
   currency: "CZK" | "EUR" | "USD";
 
-  // Poplatky
-  entryFeePercent: number;         // vstupní poplatek %
+  // Vstupní poplatek — tři různé režimy
+  entryFeeMode: EntryFeeMode;
+  entryFeeFixedAmount: number;     // Kč/€ — pro mode "upfront_fixed"
+  entryFeePercent: number;         // % — pro mode "per_contribution_pct" a "target_pct"
+  targetAmount: number;            // cílová/smluvní částka — pro mode "target_pct"
+
   annualFeePercent: number;        // TER / roční správa %
   exitFeePercent: number;          // výstupní poplatek %
   performanceFeePercent: number;   // poplatek za výkonnost % (z nadměrného výnosu)
@@ -21,11 +31,21 @@ export interface FundInfo {
   isin?: string;
   ticker?: string;
   currency?: string;
-  oneYearReturn?: number;    // % za 1 rok
-  threeYearReturn?: number;  // % za 3 roky
-  fiveYearReturn?: number;   // % za 5 let
-  ter?: number;              // TER pokud je dostupné
-  source?: string;           // zdroj dat
+  // Výkonnost p.a.
+  oneYearReturn?: number;       // % za 1 rok
+  threeYearReturn?: number;     // % za 3 roky
+  fiveYearReturn?: number;      // % za 5 let
+  // Poplatky
+  ter?: number;                 // TER / ongoing charges % ročně
+  entryFee?: number;            // vstupní poplatek %
+  exitFee?: number;             // výstupní poplatek %
+  performanceFee?: number;      // poplatek za výkonnost %
+  custodyFee?: number;          // poplatek za úschovu/platformu % ročně
+  // Metadata fondu
+  fundCategory?: string;        // kategorie: akciový, dluhopisový, smíšený...
+  riskLevel?: number;           // SRI 1–7
+  provider?: string;            // název správce fondu
+  source?: string;              // zdroj dat
 }
 
 export interface DataPoint {

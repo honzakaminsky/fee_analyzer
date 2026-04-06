@@ -3,7 +3,23 @@ import {
   DataPoint,
   FeeCalculationResult,
   CalculationParams,
+  EntryFeeMode,
 } from "./types";
+
+// Vypočítá celkový vstupní poplatek podle zvoleného režimu
+export function calcEntryFee(contract: ContractData): number {
+  switch (contract.entryFeeMode) {
+    case "upfront_fixed":
+      return Math.max(0, contract.entryFeeFixedAmount || 0);
+    case "target_pct":
+      return Math.max(0, (contract.targetAmount || 0) * (contract.entryFeePercent / 100));
+    case "per_contribution_pct":
+      // U pravidelného poplatku je vstupní „poplatek" z počáteční investice
+      return Math.max(0, contract.initialInvestment * (contract.entryFeePercent / 100));
+    default:
+      return Math.max(0, contract.initialInvestment * (contract.entryFeePercent / 100));
+  }
+}
 
 export const ETF_TER = 0.22;
 
@@ -27,8 +43,13 @@ export function calculateFees(params: CalculationParams): FeeCalculationResult {
   const monthlyReturnRate = assumedAnnualReturn / 100 / 12;
   const etfMonthlyRate = ETF_TER / 100 / 12;
 
-  // Vstupni poplatek (den 0)
-  const entryFee = contract.initialInvestment * (contract.entryFeePercent / 100);
+  // Vstupni poplatek (den 0) — závisí na zvoleném režimu
+  const entryFee = calcEntryFee(contract);
+
+  // Pro "per_contribution_pct" strhujeme % z každého měsíčního vkladu
+  const contributionLoadRate = contract.entryFeeMode === "per_contribution_pct"
+    ? (contract.entryFeePercent / 100)
+    : 0;
 
   let cumulativeFees = entryFee;
   let etfCumulativeFees = 0; // ETF zpravidla 0 vstupní poplatek
@@ -65,7 +86,11 @@ export function calculateFees(params: CalculationParams): FeeCalculationResult {
       : 0;
     const perfFee = pv * excessReturn * (contract.performanceFeePercent / 100);
 
-    const totalMonthFees = mgmtFee + custodyFee + perfFee;
+    // Poplatek z pravidelného vkladu (jen pro per_contribution_pct režim)
+    const contributionLoadFee = monthlyContribution * contributionLoadRate;
+    const netContribution = monthlyContribution - contributionLoadFee;
+
+    const totalMonthFees = mgmtFee + custodyFee + perfFee + contributionLoadFee;
     cumulativeFees += totalMonthFees;
     etfCumulativeFees += pv * etfMonthlyRate;
 
@@ -74,7 +99,7 @@ export function calculateFees(params: CalculationParams): FeeCalculationResult {
     totalCustodyFees += custodyFee;
 
     // Aktualizuj portfolio
-    portfolioValue = pv + grossGrowth + monthlyContribution - totalMonthFees;
+    portfolioValue = pv + grossGrowth + netContribution - (mgmtFee + custodyFee + perfFee);
     if (portfolioValue < 0) portfolioValue = 0;
 
     dataPoints.push({
@@ -142,9 +167,12 @@ export function defaultContract(): ContractData {
     fundName: "",
     isin: "",
     contractStartDate: new Date().toISOString().split("T")[0],
-    initialInvestment: 100000,
+    initialInvestment: 0,
     currency: "CZK",
+    entryFeeMode: "upfront_fixed",
+    entryFeeFixedAmount: 0,
     entryFeePercent: 0,
+    targetAmount: 0,
     annualFeePercent: 0,
     exitFeePercent: 0,
     performanceFeePercent: 0,
@@ -152,4 +180,13 @@ export function defaultContract(): ContractData {
     custodyFeePercent: 0,
     monthlyContribution: 0,
   };
+}
+
+// Pomocná funkce: vrátí entryFeePercent ekvivalent pro zobrazení
+export function entryFeeModeLabel(mode: EntryFeeMode): string {
+  switch (mode) {
+    case "upfront_fixed":        return "Předplacený — fixní částka";
+    case "per_contribution_pct": return "Z každého vkladu (%)";
+    case "target_pct":           return "Z cílové částky (%)";
+  }
 }

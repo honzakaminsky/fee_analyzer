@@ -20,10 +20,12 @@ export default function RootLayout({
       <body className={`${inter.className} bg-gray-50 min-h-screen`}>
         <header className="bg-white border-b border-gray-200">
           <div className="max-w-5xl mx-auto px-4 py-4 flex items-center gap-3">
-            <div className="w-8 h-8 bg-green-600 rounded-lg flex items-center justify-center text-white font-bold text-sm">
-              P
-            </div>
-            <span className="font-semibold text-gray-900">Analyzátor poplatků</span>
+            <a href="/" className="flex items-center gap-3 hover:opacity-80 transition-opacity">
+              <div className="w-8 h-8 bg-green-600 rounded-lg flex items-center justify-center text-white font-bold text-sm">
+                P
+              </div>
+              <span className="font-semibold text-gray-900">Analyzátor poplatků</span>
+            </a>
             <span className="ml-auto text-xs text-gray-400">Beta verze — zdarma</span>
           </div>
         </header>
