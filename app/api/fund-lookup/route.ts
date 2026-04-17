@@ -1854,6 +1854,58 @@ Pokud hodnotu nenajdeš, použij null.`;
   return {};
 }
 
+// ── Claude web search — CZK výnosy pro BE/zahraniční fondy prodávané v ČR ──
+// Volá se když Morningstar vrátí EUR výnosy ale fond je CZK-denominovaný (BE ISINy, ČSOB/KBC).
+async function callClaudeForCzkReturns(isin: string, fundName = ""): Promise<Partial<FundInfo>> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return {};
+
+  const nameCtx = fundName ? ` (${fundName})` : "";
+  const prompt = `Fond ISIN ${isin}${nameCtx} je prodáván v České republice přes ČSOB.
+Najdi historickou výkonnost tohoto fondu v CZK (korunách) — průměrný roční výnos p.a. za 1 rok, 3 roky a 5 let.
+Hledej VÝHRADNĚ na těchto stránkách (zobrazují CZK výnosy):
+- https://www.csob.cz/lide/investicni-produkty/nabidka-investic/detail/isin/${isin}/1
+- https://www.csobam.cz/portal/podilove-fondy/detail-fondu/-/isin/${isin}/1
+Chci výnosy V KORUNÁCH (CZK), ne v EUR.
+Odpověz POUZE jako JSON: ${AI_JSON_SCHEMA}
+Pokud hodnotu nenajdeš, použij null. Nevymýšlej si čísla.`;
+
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "web-search-2025-03-05",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 512,
+        tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 3 }],
+        messages: [{ role: "user", content: prompt }],
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!res.ok) { console.log(`[fund-lookup] ClaudeCzkReturns: ${res.status}`); return {}; }
+    const json = await res.json();
+    const content: Array<{ type: string; text?: string }> = json?.content ?? [];
+    const textBlock = content.find(b => b.type === "text");
+    if (textBlock?.text) {
+      console.log(`[fund-lookup] ClaudeCzkReturns: ${textBlock.text.slice(0, 300)}`);
+      const parsed = parseAiJson(textBlock.text, "Claude CZK returns");
+      // Vrátíme pouze výnosy (ne TER/poplatky — ty jsou v EUR z Morningstar přesnější)
+      return {
+        oneYearReturn:   parsed.oneYearReturn,
+        threeYearReturn: parsed.threeYearReturn,
+        fiveYearReturn:  parsed.fiveYearReturn,
+        source: "csob.cz (CZK)",
+      };
+    }
+  } catch (e) { console.log(`[fund-lookup] ClaudeCzkReturns error: ${e}`); }
+  return {};
+}
+
 // ── Claude s nástrojem pro načítání stránek (tool use) ───────────
 // Starý přístup — fetch_url na předpřipravené URL. Ponecháno pro mezinárodní ISINy.
 async function callClaudeWithTools(isin: string, providerName = ""): Promise<Partial<FundInfo>> {
@@ -2545,8 +2597,10 @@ export async function GET(req: NextRequest) {
     const isCzIsin = isin.startsWith("CZ");
     const isSkIsin = isin.startsWith("SK");
     const isLocalIsin = isCzIsin || isSkIsin;
-    const [msEN, msLocalWidget, msCzScreener, ticker, justEtf] = await Promise.all([
-      // Pro mezinárodní ISINy (LU, IE...) použij globální screener
+    // BE ISINy jsou belgické fondy prodávané v ČR — typicky denominované v CZK (KBC/ČSOB)
+    const isBelgianIsin = isin.startsWith("BE");
+    const [msEN, msLocalWidget, msCzScreener, msCzkScreener, ticker, justEtf] = await Promise.all([
+      // Pro mezinárodní ISINy (LU, IE...) použij globální screener v EUR
       isIsin && !isLocalIsin ? morningstarScreener(isin, "en-GB", "EUR") : Promise.resolve<MsScreenerResult>({}),
       // CZ/SK ISINy → lokální Morningstar widget (má SecId pro detail stránku)
       isIsin && isCzIsin ? morningstarCzSearch(isin)
@@ -2556,12 +2610,14 @@ export async function GET(req: NextRequest) {
       isIsin && isCzIsin ? morningstarScreener(isin, "cs-CZ", "CZK")
         : isIsin && isSkIsin ? morningstarScreener(isin, "sk-SK", "EUR")
         : Promise.resolve<MsScreenerResult>({}),
+      // BE ISINy (ČSOB/KBC fondy) → screener en-GB ale s CZK měnou pro správné korunové výnosy
+      isIsin && isBelgianIsin ? morningstarScreener(isin, "en-GB", "CZK") : Promise.resolve<MsScreenerResult>({}),
       yahooSearch(query),
       isIsin && !isLocalIsin ? justEtfLookup(isin) : Promise.resolve({}),
     ]);
-    console.log(`[fund-lookup] phase1: msEN=${JSON.stringify(msEN)} msLocal=${JSON.stringify(msLocalWidget)} ticker=${ticker}`);
+    console.log(`[fund-lookup] phase1: msEN=${JSON.stringify(msEN)} msLocal=${JSON.stringify(msLocalWidget)} msCZK=${JSON.stringify(msCzkScreener)} ticker=${ticker}`);
 
-    const msName = msEN.name || msLocalWidget.name || msCzScreener.name || "";
+    const msName = msEN.name || msCzkScreener.name || msLocalWidget.name || msCzScreener.name || "";
     const autoProvider = detectProvider(isin, msName || ticker || "");
     const effectiveProvider = providerParam || autoProvider;
 
@@ -2607,8 +2663,8 @@ export async function GET(req: NextRequest) {
     console.log(`[fund-lookup] phase2: provider=${effectiveProvider} providerData=${JSON.stringify(providerData)} msCZ=${JSON.stringify(msCZ)} msLocalWidget=${JSON.stringify(msLocalWidget)} kurzy=${JSON.stringify(kurzyData)}`);
 
     // ── Fáze 3: pokud stále nemáme TER a máme SecId, zkusíme fund page ──
-    const secId = msLocalWidget.secId || msCzScreener.secId || msEN.secId || (msCZ as MsScreenerResult).secId;
-    const hasTer = validTer(msEN.ter) || validTer(msLocalWidget.ter) ||
+    const secId = msLocalWidget.secId || msCzScreener.secId || msCzkScreener.secId || msEN.secId || (msCZ as MsScreenerResult).secId;
+    const hasTer = validTer(msEN.ter) || validTer(msCzkScreener.ter) || validTer(msLocalWidget.ter) ||
                    validTer(msCzScreener.ter) ||
                    validTer((msCZ as Partial<FundInfo>).ter) ||
                    validTer((providerData as Partial<FundInfo>).ter) ||
@@ -2621,7 +2677,7 @@ export async function GET(req: NextRequest) {
     // ── Fáze 4: Gemini AI fallback pro CZ/SK ISINy ───────────────────
     const hasTerAfterP3 = hasTer || validTer((msFundPage as Partial<FundInfo>).ter);
     // Zkontroluj jestli máme výnosy z dosavadních zdrojů
-    const hasReturns = [providerData, msFundPage, msLocalWidget, msCZ]
+    const hasReturns = [msCzkScreener, msEN, providerData, msFundPage, msLocalWidget, msCZ]
       .some(s => (s as Partial<FundInfo>).oneYearReturn !== undefined ||
                  (s as Partial<FundInfo>).threeYearReturn !== undefined ||
                  (s as Partial<FundInfo>).fiveYearReturn !== undefined);
@@ -2631,6 +2687,17 @@ export async function GET(req: NextRequest) {
                        (!hasTerAfterP3 || !hasReturns);
     const geminiData = needGemini
       ? await geminiLookup(isin, effectiveProvider)
+      : {};
+
+    // ── Fáze 4b: Claude Web Search pro CZK výnosy u BE fondů prodávaných v ČR ──
+    // Morningstar vrací EUR výnosy pro BE ISINy. Fond s currency=CZK potřebuje výnosy v CZK.
+    // Claude prohledá csob.cz a csobam.cz přímo.
+    const fundCurrency = msEN.currency || msCzkScreener.currency || (msCZ as Partial<FundInfo>).currency;
+    const hasAnthropicKeyLocal = !!process.env.ANTHROPIC_API_KEY;
+    const needCzkReturns = isIsin && isBelgianIsin && fundCurrency === "CZK" && hasAnthropicKeyLocal;
+    console.log(`[fund-lookup] needCzkReturns=${needCzkReturns} (isBE=${isBelgianIsin} currency=${fundCurrency} hasKey=${hasAnthropicKeyLocal})`);
+    const czkReturnsData = needCzkReturns
+      ? await callClaudeForCzkReturns(isin, msEN.name || msCzkScreener.name || "")
       : {};
 
     // ── Sestavíme výsledek ───────────────────────────────────────────
@@ -2654,6 +2721,7 @@ export async function GET(req: NextRequest) {
       (providerData as Partial<FundInfo>).name ||
       msLocalWidget.name ||
       msCzScreener.name ||
+      msCzkScreener.name ||
       msEN.name ||
       (msCZ as Partial<FundInfo>).name ||
       (kurzyData as Partial<FundInfo>).name ||
@@ -2665,6 +2733,7 @@ export async function GET(req: NextRequest) {
 
     const currency =
       msLocalWidget.currency ||
+      msCzkScreener.currency ||
       msEN.currency ||
       msCzScreener.currency ||
       (msCZ as Partial<FundInfo>).currency ||
@@ -2686,8 +2755,8 @@ export async function GET(req: NextRequest) {
 
     console.log(`[fund-lookup] RESULT: name="${name}" ter=${ter} sources=${sources.join(", ")}`);
 
-    // Výkonnost a poplatky: priorita: Yahoo > msEN (globální screener) > provider scraper > Morningstar detail > Gemini/Claude AI
-    const allSources = [yahooRet, msEN, providerData, msFundPage, geminiData, msLocalWidget, msCzScreener, msCZ, kurzyData];
+    // Výkonnost a poplatky: priorita: czkReturnsData (ČSOB CZK) > msCzkScreener > Yahoo > msEN (EUR) > provider > Morningstar detail > Gemini/Claude AI
+    const allSources = [czkReturnsData, msCzkScreener, yahooRet, msEN, providerData, msFundPage, geminiData, msLocalWidget, msCzScreener, msCZ, kurzyData];
 
     const pickNum = (key: keyof FundInfo) => {
       for (const s of allSources) {
